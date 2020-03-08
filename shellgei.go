@@ -156,8 +156,11 @@ func runCmd(cmdstr string, mediaUrls []string, config botConfig) (string, []stri
 	}
 
 	// execute shellgei in the docker
-	cmd := exec.Command("docker", "run", "--rm",
-		"--net=none",
+	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(ctx, config.Timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx,
+		"docker", "run", "--rm", "--net=none",
 		"-m", config.Memory,
 		"--oom-kill-disable",
 		"--pids-limit", "1024",
@@ -166,18 +169,18 @@ func runCmd(cmdstr string, mediaUrls []string, config botConfig) (string, []stri
 		"-v", imagesVolume+":/images",
 		"-v", mediadirPath+":/media:ro",
 		config.DockerImage,
-		"bash", "-c", fmt.Sprintf("chmod +x /%s && sync &&  ./%s | stdbuf -o0 head -c 100K", name, name))
+		"bash", "-c", fmt.Sprintf("chmod +x /%s && sync &&  ./%s | stdbuf -o0 head -c 100K", name, name),
+	)
 
 	// get result
-	var out bytes.Buffer
-	var stderr bytes.Buffer
+	var (
+		out    bytes.Buffer
+		stderr bytes.Buffer
+	)
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
 
-	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, config.Timeout)
-	defer cancel()
-
+	cmd.Run()
 	errChan := make(chan error, 1)
 	go func(ctx context.Context) {
 		errChan <- cmd.Run()
@@ -201,16 +204,24 @@ func runCmd(cmdstr string, mediaUrls []string, config botConfig) (string, []stri
 	defer func() { _ = os.RemoveAll(imgdirPath) }()
 
 	// get images from docker volume
-	_ = exec.Command("docker", "run", "--rm", "-v", imgdirPath+":/dst", "-v", imagesVolume+":/src", "bash", "-c", "cp /src/* /dst/").Run()
-
-	// search image data
-	files, err := ioutil.ReadDir(imgdirPath)
-
-	// without image
-	if err != nil || len(files) == 0 {
-		return out.String(), []string{}, nil
+	if err := getImagesFromDockerVolume(imgdirPath, imagesVolume); err != nil {
+		log.Println(err)
 	}
 
+	// search image data
+	b64img, err := encodeImages(imgdirPath, config.MediaSize)
+	return out.String(), b64img, err
+}
+
+func getImagesFromDockerVolume(dstPath, vol string) error {
+	return exec.Command("docker", "run", "--rm", "-v", dstPath+":/dst", "-v", vol+":/src", "bash", "-c", "cp /src/* /dst/").Run()
+}
+
+func encodeImages(imgdirPath string, size int64) ([]string, error) {
+	files, err := ioutil.ReadDir(imgdirPath)
+	if err != nil || len(files) == 0 {
+		return []string{}, nil
+	}
 	// with image
 	b64imgs := make([]string, 0, 4)
 	readcount := 0
@@ -229,7 +240,7 @@ func runCmd(cmdstr string, mediaUrls []string, config botConfig) (string, []stri
 
 		// if file size is zero or bigger than MediaSize[MB]
 		finfo, err := os.Stat(path)
-		if err != nil || finfo.Size() == 0 || finfo.Size() >= 1024*1024*config.MediaSize {
+		if err != nil || finfo.Size() == 0 || finfo.Size() >= 1024*1024*size {
 			continue
 		}
 
@@ -245,5 +256,5 @@ func runCmd(cmdstr string, mediaUrls []string, config botConfig) (string, []stri
 		b64imgs = append(b64imgs, b64img)
 		readcount++
 	}
-	return out.String(), b64imgs, nil
+	return b64imgs, nil
 }
